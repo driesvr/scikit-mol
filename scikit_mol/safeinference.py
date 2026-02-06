@@ -86,29 +86,45 @@ def filter_invalid_rows(warn_on_invalid=False, replace_value=np.nan):
 
             # handle case where all rows are masked e.g. single invalid input is passed
             if len(valid_indices) == 0:
-                result = np.array([])
+                # Check if we need to return a tuple (for return_std/return_cov)
+                return_std = kwargs.get("return_std", False)
+                return_cov = kwargs.get("return_cov", False)
+                if return_std or return_cov:
+                    # Return tuple of empty arrays to match expected return format
+                    result = (np.array([]), np.array([]))
+                else:
+                    result = np.array([])
             else:
                 result = func(obj, reduced_X, reduced_y, *args, **kwargs)
 
             if result is None:
                 return None
-            if isinstance(result, np.ndarray):
-                if result.ndim == 1:
-                    output = np.full(X.shape[0], replace_value)
+
+            def _fill_output(res):
+                """Helper to fill output array with valid results at correct indices."""
+                if isinstance(res, np.ndarray):
+                    if res.ndim == 1:
+                        out = np.full(X.shape[0], replace_value)
+                    else:
+                        out = np.full((X.shape[0], res.shape[1]), replace_value)
+                    out[valid_indices] = res
+                    return out
+                elif isinstance(res, pd.DataFrame):
+                    out = pd.DataFrame(index=range(X.shape[0]), columns=res.columns)
+                    out.iloc[valid_indices] = res
+                    return out
+                elif isinstance(res, pd.Series):
+                    out = pd.Series(index=range(X.shape[0]), dtype=res.dtype)
+                    out.iloc[valid_indices] = res
+                    return out
                 else:
-                    output = np.full((X.shape[0], result.shape[1]), replace_value)
-                output[valid_indices] = result
-                return output
-            elif isinstance(result, pd.DataFrame):
-                output = pd.DataFrame(index=range(X.shape[0]), columns=result.columns)
-                output.iloc[valid_indices] = result
-                return output
-            elif isinstance(result, pd.Series):
-                output = pd.Series(index=range(X.shape[0]), dtype=result.dtype)
-                output.iloc[valid_indices] = result
-                return output
-            else:
-                return result
+                    return res
+
+            # Handle tuple returns (e.g., from predict with return_std=True)
+            if isinstance(result, tuple):
+                return tuple(_fill_output(r) for r in result)
+
+            return _fill_output(result)
 
         return wrapper
 
@@ -161,7 +177,35 @@ class SafeInferenceWrapper(TransformerMixin, BaseEstimator):
 
     @available_if(lambda self: hasattr(self.estimator, "predict"))
     @filter_invalid_rows()
-    def predict(self, X, y=None):
+    def predict(self, X, y=None, return_std=False, return_cov=False):
+        """Predict using the wrapped estimator.
+
+        Parameters
+        ----------
+        X : array-like
+            Input data.
+        y : None
+            Ignored. Present for API compatibility.
+        return_std : bool, default=False
+            If True, returns standard deviation of predictions along with mean.
+            Only supported if the underlying estimator supports it
+            (e.g., GaussianProcessRegressor).
+        return_cov : bool, default=False
+            If True, returns covariance of predictions along with mean.
+            Only supported if the underlying estimator supports it
+            (e.g., GaussianProcessRegressor).
+
+        Returns
+        -------
+        y_pred : ndarray
+            Predicted values.
+        y_std : ndarray, optional
+            Standard deviation of predictions (if return_std=True).
+        y_cov : ndarray, optional
+            Covariance of predictions (if return_cov=True).
+        """
+        if return_std or return_cov:
+            return self.estimator.predict(X, return_std=return_std, return_cov=return_cov)
         return self.estimator.predict(X)
 
     @available_if(lambda self: hasattr(self.estimator, "predict_proba"))

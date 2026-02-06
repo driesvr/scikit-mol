@@ -2,6 +2,8 @@ import numpy as np
 import pandas as pd
 import pytest
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF
 from sklearn.pipeline import Pipeline
 
 from scikit_mol.conversions import SmilesToMolTransformer
@@ -150,3 +152,122 @@ def test_safeinference_wrapper_get_feature_names_out(smiles_pipeline):
     feature_names = smiles_pipeline.named_steps["FP"].get_feature_names_out()
     assert len(feature_names) == smiles_pipeline.named_steps["FP"].fpSize
     assert all(isinstance(name, str) for name in feature_names)
+
+
+# Tests for return_std functionality with GaussianProcessRegressor
+
+
+@pytest.fixture
+def gp_pipeline():
+    """Pipeline with GaussianProcessRegressor that supports return_std."""
+    return Pipeline(
+        [
+            ("s2m", SmilesToMolTransformer()),
+            ("FP", MorganFingerprintTransformer(fpSize=64)),
+            (
+                "GP",
+                SafeInferenceWrapper(
+                    GaussianProcessRegressor(kernel=RBF(), random_state=42),
+                    replace_value=np.nan,
+                ),
+            ),
+        ]
+    )
+
+
+@pytest.fixture
+def gp_pipeline_trained(gp_pipeline, SLC6A4_subset):
+    X_smiles = SLC6A4_subset.SMILES[:50].to_frame()
+    Y = SLC6A4_subset.pXC50[:50]
+    set_safe_inference_mode(gp_pipeline, True)
+    gp_pipeline.fit(X_smiles, Y)
+    return gp_pipeline
+
+
+def test_safeinference_wrapper_return_std_basic(gp_pipeline_trained, SLC6A4_subset):
+    """Test that return_std=True returns mean and std."""
+    X_test = SLC6A4_subset.SMILES[:10].to_frame()
+
+    # Test prediction with return_std=True
+    result = gp_pipeline_trained.predict(X_test, return_std=True)
+
+    assert isinstance(result, tuple)
+    assert len(result) == 2
+    y_pred, y_std = result
+    assert len(y_pred) == len(X_test)
+    assert len(y_std) == len(X_test)
+    assert not np.any(np.isnan(y_pred))
+    assert not np.any(np.isnan(y_std))
+    assert np.all(y_std >= 0)  # std should be non-negative
+
+
+def test_safeinference_wrapper_return_std_with_invalid(
+    gp_pipeline_trained, SLC6A4_subset, invalid_smiles_list
+):
+    """Test return_std=True with invalid SMILES returns NaN for invalid rows."""
+    valid_smiles = SLC6A4_subset.SMILES[:5].tolist()
+    X_test = pd.DataFrame({"SMILES": valid_smiles + invalid_smiles_list})
+
+    result = gp_pipeline_trained.predict(X_test, return_std=True)
+
+    assert isinstance(result, tuple)
+    y_pred, y_std = result
+    assert len(y_pred) == len(X_test)
+    assert len(y_std) == len(X_test)
+
+    # Valid predictions should not be NaN
+    assert not np.any(np.isnan(y_pred[: len(valid_smiles)]))
+    assert not np.any(np.isnan(y_std[: len(valid_smiles)]))
+
+    # Invalid predictions should be NaN
+    assert np.all(np.isnan(y_pred[len(valid_smiles) :]))
+    assert np.all(np.isnan(y_std[len(valid_smiles) :]))
+
+
+def test_safeinference_wrapper_return_std_all_invalid(gp_pipeline_trained):
+    """Test return_std=True when all inputs are invalid."""
+    X_test = pd.DataFrame({"SMILES": ["invalid1", "invalid2"]})
+
+    result = gp_pipeline_trained.predict(X_test, return_std=True)
+
+    assert isinstance(result, tuple)
+    y_pred, y_std = result
+    assert len(y_pred) == 2
+    assert len(y_std) == 2
+    assert np.all(np.isnan(y_pred))
+    assert np.all(np.isnan(y_std))
+
+
+def test_safeinference_wrapper_return_cov_basic(gp_pipeline_trained, SLC6A4_subset):
+    """Test that return_cov=True returns mean and covariance."""
+    X_test = SLC6A4_subset.SMILES[:5].to_frame()
+
+    result = gp_pipeline_trained.predict(X_test, return_cov=True)
+
+    assert isinstance(result, tuple)
+    assert len(result) == 2
+    y_pred, y_cov = result
+    assert len(y_pred) == len(X_test)
+    assert y_cov.shape == (len(X_test), len(X_test))
+
+
+def test_safeinference_wrapper_return_std_without_safe_mode(
+    gp_pipeline, SLC6A4_subset, invalid_smiles_list
+):
+    """Test return_std=True without safe mode raises error on invalid input."""
+    X_smiles = SLC6A4_subset.SMILES[:50].to_frame()
+    Y = SLC6A4_subset.pXC50[:50]
+
+    # Train without safe mode
+    set_safe_inference_mode(gp_pipeline, False)
+    gp_pipeline.fit(X_smiles, Y)
+
+    # Valid input should work
+    X_valid = SLC6A4_subset.SMILES[:5].to_frame()
+    result = gp_pipeline.predict(X_valid, return_std=True)
+    assert isinstance(result, tuple)
+
+    # Invalid input should raise
+    X_invalid = pd.DataFrame({"SMILES": invalid_smiles_list})
+    with pytest.raises(Exception):
+        gp_pipeline.predict(X_invalid, return_std=True)
